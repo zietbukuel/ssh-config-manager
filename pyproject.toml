@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssh-config-manager"
+version = "2.0.0"
+description = "Modern CLI tool to manage SSH config entries with safety, validation, and Include support"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Juan Timaná", email = "juan@timana.net"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "rich>=13.7.0",
+    "sshconf>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.11.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+completion = [
+    "argcomplete>=3.0.0",
+]
+
+[project.entry-points]
+console_scripts = { "ssh-manager" = "ssh_manager:main" }
+
+[project.urls]
+Homepage = "https://github.com/zietbukuel/ssh-config-manager"
+Repository = "https://github.com/zietbukuel/ssh-config-manager"
+Issues = "https://github.com/zietbukuel/ssh-config-manager/issues"
+
+[tool.setuptools]
+py-modules = ["ssh_manager"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "T20"]
+ignore = ["E501", "T201"]
+per-file-ignores = { "tests/*" = ["S101", "T201"] }
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true

@@ -1,0 +1,29 @@
+Source: ssh-config-manager
+Section: utils
+Priority: optional
+Maintainer: Juan Timaná <juan@timana.net>
+Build-Depends: debhelper-compat (= 13), python3-all, python3-setuptools, python3-wheel, python3-build, python3-installer
+Standards-Version: 4.6.2
+Homepage: https://github.com/zietbukuel/ssh-config-manager
+Vcs-Git: https://github.com/zietbukuel/ssh-config-manager.git
+Vcs-Browser: https://github.com/zietbukuel/ssh-config-manager
+Rules-Requires-Root: no
+
+Package: ssh-config-manager
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends}, python3-rich, python3-sshconf
+Recommends: python3-argcomplete
+Suggests: pipx
+Description: Modern CLI tool to manage SSH config entries
+ SSH Config Manager is a modern CLI tool built with Python to simplify the
+ management of your SSH configuration file (~/.ssh/config).
+ .
+ Features:
+  * Add, list, search, edit, and delete SSH entries
+  * Automatic timestamped backups before writes
+  * Hostname/IP, port, and identity file validation
+  * Include directive support (~/.ssh/config.d/)
+  * Shell completion (Bash, Zsh, Fish)
+  * Rich formatted output
+  * Modern Python packaging (pyproject.toml)
+  * Comprehensive test suite
