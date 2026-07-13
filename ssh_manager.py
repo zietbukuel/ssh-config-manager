@@ -15,20 +15,19 @@ Features:
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from rich.console import Console
 from rich.table import Table
-from sshconf import read_ssh_config, empty_ssh_config_file
+from sshconf import empty_ssh_config_file, read_ssh_config  # type: ignore
 
 try:
-    import argcomplete
+    import argcomplete  # type: ignore
     ARGC_COMPLETE_AVAILABLE = True
 except ImportError:
     ARGC_COMPLETE_AVAILABLE = False
@@ -75,13 +74,13 @@ class SSHConfigManager:
             console.print(f"[dim]Backup created: {backup_path}[/dim]")
         return backup_path
 
-    def load_config(self):
+    def load_config(self) -> Any:
         """Load SSH config, creating empty if missing."""
         if not self.config_path.exists():
             return empty_ssh_config_file()
         return read_ssh_config(str(self.config_path))
 
-    def save_config(self, config):
+    def save_config(self, config: Any) -> None:
         """Save config with automatic backup."""
         self._create_backup()
         config.write(str(self.config_path))
@@ -154,16 +153,16 @@ class SSHConfigManager:
                 })
         return results
 
-    def get_host(self, host: str) -> Optional[dict]:
+    def get_host(self, host: str) -> dict | None:
         """Get detailed info for a specific host."""
         config = self.load_config()
         if host not in config.hosts():
             return None
         host_data = config.host(host)
-        return {k: v for k, v in host_data.items()}
+        return dict(host_data.items())
 
     def add_entry(self, host: str, hostname: str, user: str, port: int,
-                  identity_file: Optional[str] = None) -> None:
+                  identity_file: str | None = None) -> None:
         """Add a new SSH config entry with validation."""
         # Validate inputs
         if not self.validate_host_alias(host):
@@ -194,25 +193,26 @@ class SSHConfigManager:
 
         # Validate field-specific values
         field_lower = field.lower()
+        val_to_set: str | int = value
         if field_lower == "port":
             try:
                 port_val = int(value)
                 if not self.validate_port(port_val):
                     raise ValueError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
-                value = port_val
+                val_to_set = port_val
             except ValueError as e:
                 if "Port must be between" in str(e):
                     raise
-                raise ValueError("Port must be a valid integer")
+                raise ValueError("Port must be a valid integer") from e
         elif field_lower == "hostname":
             if not self.validate_hostname(value):
                 raise ValueError(f"Invalid hostname/IP: {value}")
         elif field_lower == "identityfile":
             if not self.validate_identity_file(value):
                 raise ValueError(f"Identity file not found or not readable: {value}")
-            value = str(Path(value).expanduser())
+            val_to_set = str(Path(value).expanduser())
 
-        config.set(host, **{field_lower: value})
+        config.set(host, **{field_lower: val_to_set})
         self.save_config(config)
 
     def delete_entry(self, host: str) -> None:
@@ -262,7 +262,7 @@ class SSHConfigManager:
                 f.seek(0, 0)
                 f.write(f"Include config.d/*.conf\n\n{existing}")
 
-    def show_include(self, name: str) -> Optional[str]:
+    def show_include(self, name: str) -> str | None:
         """Show content of an include file."""
         include_path = self.include_dir / name
         if not include_path.exists():
@@ -320,7 +320,7 @@ def setup_argcomplete(parser: argparse.ArgumentParser) -> None:
     if not ARGC_COMPLETE_AVAILABLE:
         return
 
-    def host_completer(prefix, parsed_args, **kwargs):
+    def host_completer(prefix: str, parsed_args: Any, **kwargs: Any) -> list[str]:
         """Complete host aliases from SSH config."""
         manager = SSHConfigManager()
         try:
@@ -329,7 +329,7 @@ def setup_argcomplete(parser: argparse.ArgumentParser) -> None:
         except Exception:
             return []
 
-    def field_completer(prefix, parsed_args, **kwargs):
+    def field_completer(prefix: str, parsed_args: Any, **kwargs: Any) -> list[str]:
         """Complete field names for edit command."""
         fields = ["hostname", "user", "port", "identityfile"]
         return [f for f in fields if f.startswith(prefix)]
@@ -337,9 +337,9 @@ def setup_argcomplete(parser: argparse.ArgumentParser) -> None:
     # Add completers to relevant arguments
     for action in parser._actions:
         if action.dest == "host" and action.help and "alias" in action.help:
-            action.completer = host_completer
+            action.completer = host_completer  # type: ignore[attr-defined]
         if action.dest == "field":
-            action.completer = field_completer
+            action.completer = field_completer  # type: ignore[attr-defined]
 
     # Register the completion for the main command
     argcomplete.autocomplete(parser)
@@ -400,7 +400,7 @@ Examples:
     delete_parser.add_argument("host", help="Host alias to delete")
 
     # Include commands
-    include_list_parser = subparsers.add_parser("include-list",
+    subparsers.add_parser("include-list",
                                                  help="List all Include config files")
     include_add_parser = subparsers.add_parser("include-add",
                                                 help="Add a new Include config file")
@@ -618,78 +618,6 @@ def main() -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser with all commands."""
-    parser = argparse.ArgumentParser(
-        description="Manage SSH config entries with safety and validation",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  ssh-manager add myserver 192.168.1.100 root 22 --identity-file ~/.ssh/id_ed25519
-  ssh-manager list -v
-  ssh-manager search myserver
-  ssh-manager show myserver
-  ssh-manager edit myserver user admin
-  ssh-manager delete myserver
-  ssh-manager include-list
-  ssh-manager include-add myserver "Host myserver\\n  HostName 10.0.0.1"
-  ssh-manager include-show myserver
-  ssh-manager completion bash
-        """
-    )
-
-    subparsers = parser.add_subparsers(dest="command", help="Available commands", metavar="COMMAND")
-
-    # Add command
-    add_parser = subparsers.add_parser("add", help="Add a new SSH config entry")
-    add_parser.add_argument("host", help="Host alias (e.g., myserver)")
-    add_parser.add_argument("hostname", help="Server hostname or IP address")
-    add_parser.add_argument("user", help="Username to connect as")
-    add_parser.add_argument("port", type=int, help="Port number (1-65535)")
-    add_parser.add_argument("--identity-file", help="Path to private key file")
-
-    # List command
-    list_parser = subparsers.add_parser("list", help="List all SSH config entries")
-    list_parser.add_argument("-v", "--verbose", action="store_true",
-                             help="Show verbose output including IdentityFile")
-
-    # Search command
-    search_parser = subparsers.add_parser("search", help="Search entries by host or hostname")
-    search_parser.add_argument("query", help="Search term")
-
-    # Show command
-    show_parser = subparsers.add_parser("show", help="Show detailed information for a host")
-    show_parser.add_argument("host", help="Host alias to display")
-
-    # Edit command
-    edit_parser = subparsers.add_parser("edit", help="Edit an existing SSH config entry")
-    edit_parser.add_argument("host", help="Host alias to edit")
-    edit_parser.add_argument("field", choices=["hostname", "user", "port", "identityfile"],
-                             help="Field to update")
-    edit_parser.add_argument("value", help="New value for the field")
-
-    # Delete command
-    delete_parser = subparsers.add_parser("delete", help="Delete an SSH config entry")
-    delete_parser.add_argument("host", help="Host alias to delete")
-
-    # Include commands
-    include_list_parser = subparsers.add_parser("include-list",
-                                                 help="List all Include config files")
-    include_add_parser = subparsers.add_parser("include-add",
-                                                help="Add a new Include config file")
-    include_add_parser.add_argument("name", help="Name of the include file (without .conf)")
-    include_add_parser.add_argument("content", help="Content of the include file (use \\n for newlines)")
-    include_show_parser = subparsers.add_parser("include-show",
-                                                 help="Show content of an Include config file")
-    include_show_parser.add_argument("name", help="Name of the include file")
-
-    # Completion command
-    completion_parser = subparsers.add_parser("completion",
-                                               help="Generate shell completion script")
-    completion_parser.add_argument("shell", choices=["bash", "zsh", "fish"],
-                                    help="Shell to generate completion for")
-
-    return parser
 
 
 if __name__ == "__main__":

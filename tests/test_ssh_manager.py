@@ -4,10 +4,17 @@ Test suite for ssh-config-manager.
 """
 
 import os
+import sys
 import tempfile
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+
+import pytest
+
+# Ensure the current virtualenv's bin directory is in PATH for subprocess tests
+if sys.executable:
+    bin_dir = os.path.dirname(sys.executable)
+    if bin_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 from ssh_manager import SSHConfigManager
 
