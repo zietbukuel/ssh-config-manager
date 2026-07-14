@@ -18,12 +18,19 @@ lib64/
 parts/
 sdist/
 var/
+pkg/
 wheels/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
+*.zst
+.BUILDINFO
+.PKGINFO
+.MTREE
+.SRCINFO
+src/
 
 # Pytest / coverage
 .pytest_cache/

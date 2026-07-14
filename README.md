@@ -34,8 +34,8 @@ SSH Config Manager is a modern CLI tool built with Python to simplify the manage
 
 ```bash
 # Install pipx if not already installed
-# Arch: sudo pacman -S pipx
-# Debian/Ubuntu: sudo apt install pipx
+# Arch: sudo pacman -S python-pipx
+# Debian/Ubuntu: sudo apt install python3-pipx
 # macOS: brew install pipx
 
 # Install ssh-config-manager

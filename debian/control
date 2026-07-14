@@ -13,7 +13,7 @@ Package: ssh-config-manager
 Architecture: all
 Depends: ${python3:Depends}, ${misc:Depends}, python3-rich, python3-sshconf
 Recommends: python3-argcomplete
-Suggests: pipx
+Suggests: python3-pipx
 Description: Modern CLI tool to manage SSH config entries
  SSH Config Manager is a modern CLI tool built with Python to simplify the
  management of your SSH configuration file (~/.ssh/config).
