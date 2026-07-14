@@ -1,0 +1,12 @@
+ssh-config-manager (2.0.0-1) unstable; urgency=medium
+
+  * New upstream release v2.0.0
+  * Modernized packaging with pyproject.toml
+  * Added automatic backup functionality
+  * Added input validation (hostname, port, identity file)
+  * Added Include directive support (~/.ssh/config.d/)
+  * Added shell completion (Bash, Zsh, Fish)
+  * Comprehensive test suite (40 tests)
+  * Updated to use python3-build and python3-installer
+
+ -- Juan Timaná <juan@timana.net>  Mon, 06 Jul 2026 15:30:00 -0500

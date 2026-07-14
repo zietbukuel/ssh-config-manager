@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=pybuild
+
+# Override to run tests
+override_dh_auto_test:
+	pytest tests/ -v
+
+# Ensure we install the package properly
+override_dh_auto_install:
+	dh_auto_install
+	# Install shell completion scripts if they exist
+	# (generated via the completion command at runtime)

@@ -1,248 +1,624 @@
 #!/usr/bin/env python3
+"""
+ssh-config-manager — Modern CLI tool to manage SSH config entries with safety,
+validation, and Include directive support.
 
-# Import necessary libraries
-import os  # For file path operations
-import sys  # For system-level operations like exiting
-import argparse  # For parsing command-line arguments
-from rich.console import Console  # For rich text formatting in the terminal
-from rich.table import Table  # For creating tables in the terminal
-from sshconf import read_ssh_config, empty_ssh_config_file  # For managing SSH config files
+Features:
+- Add, list, search, show, edit, delete SSH config entries
+- Automatic backup before writes
+- Hostname/port/identity file validation
+- Include directive support (config.d/ directories)
+- Shell completion (argcomplete + manual completion command)
+- Rich formatted output
+"""
 
-# Initialize Rich console for colored and styled output
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from rich.console import Console
+from rich.table import Table
+from sshconf import empty_ssh_config_file, read_ssh_config  # type: ignore
+
+try:
+    import argcomplete  # type: ignore
+    ARGC_COMPLETE_AVAILABLE = True
+except ImportError:
+    ARGC_COMPLETE_AVAILABLE = False
+
+# Initialize Rich console
 console = Console()
 
-# Define the path to the SSH config file (~/.ssh/config)
-SSH_CONFIG_PATH = os.path.expanduser("~/.ssh/config")
+# SSH config paths
+DEFAULT_SSH_DIR = Path.home() / ".ssh"
+DEFAULT_SSH_CONFIG_PATH = DEFAULT_SSH_DIR / "config"
+DEFAULT_BACKUP_DIR = DEFAULT_SSH_DIR / "backups"
+DEFAULT_INCLUDE_DIR = DEFAULT_SSH_DIR / "config.d"
 
-def load_ssh_config():
-    """
-    Load the SSH config file.
-    If the file doesn't exist, return an empty SSH config file object.
-    """
-    if not os.path.exists(SSH_CONFIG_PATH):
-        return empty_ssh_config_file()  # Return an empty config if the file doesn't exist
-    return read_ssh_config(SSH_CONFIG_PATH)  # Otherwise, load the existing config
+# Validation constants
+MAX_PORT = 65535
+MIN_PORT = 1
+HOSTNAME_REGEX = re.compile(
+    r'^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?$'
+)
+IPV4_REGEX = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+IPV6_REGEX = re.compile(r'^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::$')
 
-def save_ssh_config(config):
-    """
-    Save the updated SSH config back to the file.
-    """
-    config.write(SSH_CONFIG_PATH)  # Write the config object back to the file
 
-def add_entry(host, hostname, user, port, identity_file=None):
-    """
-    Add a new SSH config entry.
-    - host: The alias for the host (e.g., "myserver").
-    - hostname: The actual hostname or IP address (e.g., "192.168.1.100").
-    - user: The username to connect as (e.g., "root").
-    - port: The port number to connect to (e.g., 22).
-    - identity_file: (Optional) Path to the private key file.
-    """
-    config = load_ssh_config()  # Load the current SSH config
-    if host in config.hosts():  # Check if the host already exists
-        console.print(f"[bold red]Error:[/] Host '{host}' already exists.")
-        sys.exit(1)  # Exit with an error code
-    
-    # Prepare the parameters for the new entry
-    params = {
-        "hostname": hostname,
-        "user": user,
-        "port": port,
-    }
-    if identity_file:
-        params["identityfile"] = identity_file  # Add identity file if provided
-    
-    config.add(host, **params)  # Add the new host to the config
-    save_ssh_config(config)  # Save the updated config
-    console.print(f"[bold green]Host '{host}' added successfully.[/]")  # Print success message
+class SSHConfigManager:
+    """Manages SSH config file operations with safety and validation."""
 
-def list_entries(verbose=False):
-    """
-    List all SSH config entries.
-    - verbose: If True, include additional fields like IdentityFile.
-    """
-    config = load_ssh_config()  # Load the current SSH config
-    hosts = config.hosts()  # Get the list of hosts
-    
-    if not hosts:  # If no hosts are found, print a message and exit
-        console.print("[yellow]No SSH entries found.[/]")
+    def __init__(self, config_path: Path = DEFAULT_SSH_CONFIG_PATH):
+        self.config_path = config_path
+        self.ssh_dir = config_path.parent
+        self.backup_dir = self.ssh_dir / "backups"
+        self.include_dir = self.ssh_dir / "config.d"
+        self.ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        self.backup_dir.mkdir(mode=0o700, exist_ok=True)
+        self.include_dir.mkdir(mode=0o700, exist_ok=True)
+
+    def _create_backup(self) -> Path:
+        """Create a timestamped backup of the SSH config file."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"config.backup.{timestamp}"
+        backup_path = self.backup_dir / backup_name
+        if self.config_path.exists():
+            shutil.copy2(self.config_path, backup_path)
+            backup_path.chmod(0o600)
+            console.print(f"[dim]Backup created: {backup_path}[/dim]")
+        return backup_path
+
+    def load_config(self) -> Any:
+        """Load SSH config, creating empty if missing."""
+        if not self.config_path.exists():
+            return empty_ssh_config_file()
+        return read_ssh_config(str(self.config_path))
+
+    def save_config(self, config: Any) -> None:
+        """Save config with automatic backup."""
+        self._create_backup()
+        config.write(str(self.config_path))
+        self.config_path.chmod(0o600)
+
+    @staticmethod
+    def validate_hostname(hostname: str) -> bool:
+        """Validate hostname or IP address."""
+        if not hostname:
+            return False
+        if IPV4_REGEX.match(hostname):
+            parts = hostname.split('.')
+            return len(parts) == 4 and all(0 <= int(part) <= 255 for part in parts)
+        if IPV6_REGEX.match(hostname):
+            return True
+        return bool(HOSTNAME_REGEX.match(hostname))
+
+    @staticmethod
+    def validate_port(port: int) -> bool:
+        """Validate port number."""
+        return MIN_PORT <= port <= MAX_PORT
+
+    @staticmethod
+    def validate_identity_file(path: str) -> bool:
+        """Validate identity file exists and is readable."""
+        expanded = Path(path).expanduser()
+        return expanded.exists() and expanded.is_file()
+
+    @staticmethod
+    def validate_host_alias(host: str) -> bool:
+        """Validate host alias (no spaces, not empty)."""
+        return bool(host and not host.isspace() and ' ' not in host)
+
+    def list_entries(self, verbose: bool = False) -> list[dict]:
+        """List all SSH config entries."""
+        config = self.load_config()
+        hosts = config.hosts()
+        entries = []
+        for host in hosts:
+            host_data = config.host(host)
+            entry = {
+                "host": host,
+                "hostname": host_data.get("hostname", "N/A"),
+                "user": host_data.get("user", "N/A"),
+                "port": str(host_data.get("port", "N/A")),
+            }
+            if verbose:
+                entry["identityfile"] = host_data.get("identityfile", "N/A")
+                # Include any additional fields
+                for key, value in host_data.items():
+                    if key not in entry:
+                        entry[key] = value
+            entries.append(entry)
+        return entries
+
+    def search_entries(self, query: str) -> list[dict]:
+        """Search entries by host alias or hostname."""
+        config = self.load_config()
+        hosts = config.hosts()
+        results = []
+        for host in hosts:
+            host_data = config.host(host)
+            # Check if the query matches the host alias or hostname
+            if query.lower() in host.lower() or query.lower() in host_data.get("hostname", "").lower():
+                results.append({
+                    "host": host,
+                    "hostname": host_data.get("hostname", "N/A"),
+                    "user": host_data.get("user", "N/A"),
+                    "port": str(host_data.get("port", "N/A")),
+                })
+        return results
+
+    def get_host(self, host: str) -> dict | None:
+        """Get detailed info for a specific host."""
+        config = self.load_config()
+        if host not in config.hosts():
+            return None
+        host_data = config.host(host)
+        return dict(host_data.items())
+
+    def add_entry(self, host: str, hostname: str, user: str, port: int,
+                  identity_file: str | None = None) -> None:
+        """Add a new SSH config entry with validation."""
+        # Validate inputs
+        if not self.validate_host_alias(host):
+            raise ValueError("Invalid host alias: must not be empty or contain spaces")
+        if not self.validate_hostname(hostname):
+            raise ValueError(f"Invalid hostname/IP: {hostname}")
+        if not self.validate_port(port):
+            raise ValueError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
+        if identity_file and not self.validate_identity_file(identity_file):
+            raise ValueError(f"Identity file not found or not readable: {identity_file}")
+
+        config = self.load_config()
+        if host in config.hosts():
+            raise ValueError(f"Host '{host}' already exists")
+
+        params = {"hostname": hostname, "user": user, "port": port}
+        if identity_file:
+            params["identityfile"] = str(Path(identity_file).expanduser())
+
+        config.add(host, **params)
+        self.save_config(config)
+
+    def edit_entry(self, host: str, field: str, value: str) -> None:
+        """Edit a specific field of an existing entry."""
+        config = self.load_config()
+        if host not in config.hosts():
+            raise ValueError(f"Host '{host}' does not exist")
+
+        # Validate field-specific values
+        field_lower = field.lower()
+        val_to_set: str | int = value
+        if field_lower == "port":
+            try:
+                port_val = int(value)
+                if not self.validate_port(port_val):
+                    raise ValueError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
+                val_to_set = port_val
+            except ValueError as e:
+                if "Port must be between" in str(e):
+                    raise
+                raise ValueError("Port must be a valid integer") from e
+        elif field_lower == "hostname":
+            if not self.validate_hostname(value):
+                raise ValueError(f"Invalid hostname/IP: {value}")
+        elif field_lower == "identityfile":
+            if not self.validate_identity_file(value):
+                raise ValueError(f"Identity file not found or not readable: {value}")
+            val_to_set = str(Path(value).expanduser())
+
+        config.set(host, **{field_lower: val_to_set})
+        self.save_config(config)
+
+    def delete_entry(self, host: str) -> None:
+        """Delete an SSH config entry."""
+        config = self.load_config()
+        if host not in config.hosts():
+            raise ValueError(f"Host '{host}' does not exist")
+
+        config.remove(host)
+        self.save_config(config)
+
+    def list_includes(self) -> list[Path]:
+        """List all Include directive files."""
+        return sorted(self.include_dir.glob("*.conf"))
+
+    def add_include(self, name: str, content: str) -> Path:
+        """Add a new Include config file."""
+        if not name.endswith(".conf"):
+            name += ".conf"
+        include_path = self.include_dir / name
+        if include_path.exists():
+            raise ValueError(f"Include file '{name}' already exists")
+        include_path.write_text(content)
+        include_path.chmod(0o600)
+        # Update main config to include this directory if not already present
+        self._ensure_include_directive()
+        return include_path
+
+    def _ensure_include_directive(self) -> None:
+        """Ensure main config has Include directive for config.d/"""
+        # Ensure config file exists
+        self.config_path.parent.mkdir(mode=0o700, exist_ok=True)
+        if not self.config_path.exists():
+            self.config_path.write_text("")
+            self.config_path.chmod(0o600)
+
+        # Check if Include directive exists
+        has_include = False
+        content = self.config_path.read_text()
+        if "Include" in content and "config.d" in content:
+            has_include = True
+
+        if not has_include:
+            # Prepend Include directive
+            with open(self.config_path, "r+") as f:
+                existing = f.read()
+                f.seek(0, 0)
+                f.write(f"Include config.d/*.conf\n\n{existing}")
+
+    def show_include(self, name: str) -> str | None:
+        """Show content of an include file."""
+        include_path = self.include_dir / name
+        if not include_path.exists():
+            # Try with .conf extension
+            if not name.endswith(".conf"):
+                include_path = self.include_dir / f"{name}.conf"
+        if include_path.exists():
+            return include_path.read_text()
+        return None
+
+
+def print_table(entries: list[dict], title: str, verbose: bool = False) -> None:
+    """Print entries as a Rich table."""
+    if not entries:
+        console.print("[yellow]No SSH entries found.[/yellow]")
         return
-    
-    # Create a table to display the SSH entries
-    table = Table(title="SSH Config Entries", show_header=True, header_style="bold magenta")
-    table.add_column("Host", style="cyan", justify="left")  # Host alias column
-    table.add_column("Hostname", style="green", justify="left")  # Hostname/IP column
-    table.add_column("User", style="blue", justify="left")  # Username column
-    table.add_column("Port", style="yellow", justify="center")  # Port column
-    if verbose:  # Add IdentityFile column if verbose mode is enabled
-        table.add_column("IdentityFile", style="magenta", justify="left")
-    
-    # Populate the table with data from the SSH config
-    for host in hosts:
-        host_data = config.host(host)  # Get details for each host
-        row = [
-            host,
-            host_data.get("hostname", "N/A"),  # Default to "N/A" if field is missing
-            host_data.get("user", "N/A"),
-            str(host_data.get("port", "N/A")),
-        ]
-        if verbose:  # Add IdentityFile if verbose mode is enabled
-            row.append(host_data.get("identityfile", "N/A"))
-        table.add_row(*row)  # Add the row to the table
-    
-    console.print(table)  # Print the table to the terminal
 
-def search_entries(query):
-    """
-    Search for SSH config entries by host or hostname.
-    - query: The search term (can match either host alias or hostname).
-    """
-    config = load_ssh_config()  # Load the current SSH config
-    hosts = config.hosts()  # Get the list of hosts
-    
-    results = []  # Store matching results
-    for host in hosts:
-        host_data = config.host(host)  # Get details for each host
-        # Check if the query matches the host alias or hostname
-        if query in host or query in host_data.get("hostname", ""):
-            results.append((host, host_data))
-    
-    if not results:  # If no matches are found, print a message and exit
-        console.print(f"[yellow]No matches found for query: {query}[/]")
-        return
-    
-    # Create a table to display the search results
-    table = Table(title=f"Search Results for '{query}'", show_header=True, header_style="bold magenta")
+    table = Table(title=title, show_header=True, header_style="bold magenta")
     table.add_column("Host", style="cyan", justify="left")
     table.add_column("Hostname", style="green", justify="left")
     table.add_column("User", style="blue", justify="left")
     table.add_column("Port", style="yellow", justify="center")
-    
-    # Populate the table with matching results
-    for host, host_data in results:
-        table.add_row(
-            host,
-            host_data.get("hostname", "N/A"),
-            host_data.get("user", "N/A"),
-            str(host_data.get("port", "N/A")),
-        )
-    
-    console.print(table)  # Print the table to the terminal
+    if verbose:
+        table.add_column("IdentityFile", style="magenta", justify="left")
 
-def show_host(host):
-    """
-    Display detailed information about a specific host.
-    - host: The alias of the host to display.
-    """
-    config = load_ssh_config()  # Load the current SSH config
-    if host not in config.hosts():  # Check if the host exists
-        console.print(f"[bold red]Error:[/] Host '{host}' does not exist.")
-        sys.exit(1)  # Exit with an error code
-    
-    host_data = config.host(host)  # Get details for the specified host
-    
-    # Create a table to display the host's details
+    for entry in entries:
+        row = [entry["host"], entry["hostname"], entry["user"], entry["port"]]
+        if verbose:
+            row.append(entry.get("identityfile", "N/A"))
+        table.add_row(*row)
+
+    console.print(table)
+
+
+def print_host_details(host: str, host_data: dict) -> None:
+    """Print detailed host information."""
     table = Table(title=f"Details for Host '{host}'", show_header=True, header_style="bold magenta")
-    table.add_column("Field", style="cyan", justify="left")  # Field name column
-    table.add_column("Value", style="green", justify="left")  # Field value column
-    
-    # Populate the table with the host's details
-    for key, value in host_data.items():
-        table.add_row(key.capitalize(), str(value))  # Capitalize field names for readability
-    
-    console.print(table)  # Print the table to the terminal
+    table.add_column("Field", style="cyan", justify="left")
+    table.add_column("Value", style="green", justify="left")
 
-def edit_entry(host, field, value):
-    """
-    Edit an existing SSH config entry.
-    - host: The alias of the host to edit.
-    - field: The field to update (e.g., "hostname", "user", "port", "identityfile").
-    - value: The new value for the field.
-    """
-    config = load_ssh_config()  # Load the current SSH config
-    if host not in config.hosts():  # Check if the host exists
-        console.print(f"[bold red]Error:[/] Host '{host}' does not exist.")
-        sys.exit(1)  # Exit with an error code
-    
-    # Update the specified field with the new value
-    config.set(host, **{field.lower(): value})  # Convert field to lowercase for consistency
-    save_ssh_config(config)  # Save the updated config
-    console.print(f"[bold green]Host '{host}' updated successfully.[/] Field '{field}' set to '{value}'.")  # Print success message
+    for key, value in sorted(host_data.items()):
+        table.add_row(key.capitalize(), str(value))
 
-def delete_entry(host):
-    """
-    Delete an SSH config entry.
-    - host: The alias of the host to delete.
-    """
-    config = load_ssh_config()  # Load the current SSH config
-    if host not in config.hosts():  # Check if the host exists
-        console.print(f"[bold red]Error:[/] Host '{host}' does not exist.")
-        sys.exit(1)  # Exit with an error code
-    
-    # Confirm deletion with the user
-    confirm = console.input(f"[bold yellow]Are you sure you want to delete host '{host}'? (y/n): [/]")
-    if confirm.lower() != 'y':  # If the user cancels, exit without deleting
-        console.print("[yellow]Deletion canceled.[/]")
+    console.print(table)
+
+
+def confirm_deletion(host: str) -> bool:
+    """Prompt user for deletion confirmation."""
+    response = console.input(f"[bold yellow]Are you sure you want to delete host '{host}'? (y/n): [/]")
+    return response.lower() == 'y'
+
+
+def setup_argcomplete(parser: argparse.ArgumentParser) -> None:
+    """Configure argcomplete for shell completion."""
+    if not ARGC_COMPLETE_AVAILABLE:
         return
-    
-    config.remove(host)  # Remove the host from the config
-    save_ssh_config(config)  # Save the updated config
-    console.print(f"[bold green]Host '{host}' deleted successfully.[/]")  # Print success message
 
-def main():
-    """
-    Main function to handle command-line arguments and execute commands.
-    """
-    parser = argparse.ArgumentParser(description="Manage SSH config entries from the command line.")
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")  # Add subcommands
-    
-    # Add command: Add a new SSH config entry
+    def host_completer(prefix: str, parsed_args: Any, **kwargs: Any) -> list[str]:
+        """Complete host aliases from SSH config."""
+        manager = SSHConfigManager()
+        try:
+            hosts = manager.load_config().hosts()
+            return [h for h in hosts if h.startswith(prefix)]
+        except Exception:
+            return []
+
+    def field_completer(prefix: str, parsed_args: Any, **kwargs: Any) -> list[str]:
+        """Complete field names for edit command."""
+        fields = ["hostname", "user", "port", "identityfile"]
+        return [f for f in fields if f.startswith(prefix)]
+
+    # Add completers to relevant arguments
+    for action in parser._actions:
+        if action.dest == "host" and action.help and "alias" in action.help:
+            action.completer = host_completer  # type: ignore[attr-defined]
+        if action.dest == "field":
+            action.completer = field_completer  # type: ignore[attr-defined]
+
+    # Register the completion for the main command
+    argcomplete.autocomplete(parser)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with all commands."""
+    parser = argparse.ArgumentParser(
+        description="Manage SSH config entries with safety and validation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ssh-manager add myserver 192.168.1.100 root 22 --identity-file ~/.ssh/id_ed25519
+  ssh-manager list -v
+  ssh-manager search myserver
+  ssh-manager show myserver
+  ssh-manager edit myserver user admin
+  ssh-manager delete myserver
+  ssh-manager include-list
+  ssh-manager include-add myserver "Host myserver\\n  HostName 10.0.0.1"
+  ssh-manager include-show myserver
+  ssh-manager completion bash
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands", metavar="COMMAND")
+
+    # Add command
     add_parser = subparsers.add_parser("add", help="Add a new SSH config entry")
-    add_parser.add_argument("host", help="The host alias")
-    add_parser.add_argument("hostname", help="The server's hostname or IP address")
-    add_parser.add_argument("user", help="The username to connect as")
-    add_parser.add_argument("port", type=int, help="The port number")
-    add_parser.add_argument("--identity-file", help="Path to the private key file")
-    
-    # List command: List all SSH config entries
+    add_parser.add_argument("host", help="Host alias (e.g., myserver)")
+    add_parser.add_argument("hostname", help="Server hostname or IP address")
+    add_parser.add_argument("user", help="Username to connect as")
+    add_parser.add_argument("port", type=int, help="Port number (1-65535)")
+    add_parser.add_argument("--identity-file", help="Path to private key file")
+
+    # List command
     list_parser = subparsers.add_parser("list", help="List all SSH config entries")
-    list_parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose output")
-    
-    # Search command: Search for SSH config entries
-    search_parser = subparsers.add_parser("search", help="Search for SSH config entries by host or hostname")
-    search_parser.add_argument("query", help="The search query")
-    
-    # Show command: Display detailed information about a specific host
-    show_parser = subparsers.add_parser("show", help="Display detailed information about a specific host")
-    show_parser.add_argument("host", help="The host alias")
-    
-    # Edit command: Edit an existing SSH config entry
+    list_parser.add_argument("-v", "--verbose", action="store_true",
+                             help="Show verbose output including IdentityFile")
+
+    # Search command
+    search_parser = subparsers.add_parser("search", help="Search entries by host or hostname")
+    search_parser.add_argument("query", help="Search term")
+
+    # Show command
+    show_parser = subparsers.add_parser("show", help="Show detailed information for a host")
+    show_parser.add_argument("host", help="Host alias to display")
+
+    # Edit command
     edit_parser = subparsers.add_parser("edit", help="Edit an existing SSH config entry")
-    edit_parser.add_argument("host", help="The host alias")
-    edit_parser.add_argument("field", choices=["hostname", "user", "port", "identityfile"], help="The field to edit")
-    edit_parser.add_argument("value", help="The new value for the field")
-    
-    # Delete command: Delete an SSH config entry
+    edit_parser.add_argument("host", help="Host alias to edit")
+    edit_parser.add_argument("field", choices=["hostname", "user", "port", "identityfile"],
+                             help="Field to update")
+    edit_parser.add_argument("value", help="New value for the field")
+
+    # Delete command
     delete_parser = subparsers.add_parser("delete", help="Delete an SSH config entry")
-    delete_parser.add_argument("host", help="The host alias")
-    
-    args = parser.parse_args()  # Parse the command-line arguments
-    
-    # Execute the appropriate command based on the parsed arguments
-    if args.command == "add":
-        add_entry(args.host, args.hostname, args.user, args.port, args.identity_file)
-    elif args.command == "list":
-        list_entries(args.verbose)
-    elif args.command == "search":
-        search_entries(args.query)
-    elif args.command == "show":
-        show_host(args.host)
-    elif args.command == "edit":
-        edit_entry(args.host, args.field, args.value)
-    elif args.command == "delete":
-        delete_entry(args.host)
-    else:
-        parser.print_help()  # Print help if no valid command is provided
+    delete_parser.add_argument("host", help="Host alias to delete")
+
+    # Include commands
+    subparsers.add_parser("include-list",
+                                                 help="List all Include config files")
+    include_add_parser = subparsers.add_parser("include-add",
+                                                help="Add a new Include config file")
+    include_add_parser.add_argument("name", help="Name of the include file (without .conf)")
+    include_add_parser.add_argument("content", help="Content of the include file (use \\n for newlines)")
+    include_show_parser = subparsers.add_parser("include-show",
+                                                 help="Show content of an Include config file")
+    include_show_parser.add_argument("name", help="Name of the include file")
+
+    # Completion command
+    completion_parser = subparsers.add_parser("completion",
+                                               help="Generate shell completion script")
+    completion_parser.add_argument("shell", choices=["bash", "zsh", "fish"],
+                                    help="Shell to generate completion for")
+
+    return parser
+
+
+def _generate_bash_completion() -> str:
+    """Generate bash completion script."""
+    return """# ssh-manager bash completion
+_ssh_manager_complete() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="add list search show edit delete include-list include-add include-show completion --help"
+
+    case "${prev}" in
+        add)
+            return 0
+            ;;
+        show|edit|delete)
+            # Complete with host aliases from SSH config
+            local hosts=$(ssh-manager list 2>/dev/null | grep -E "^│ [a-zA-Z0-9]" | awk '{print $2}' | tr -d "│")
+            COMPREPLY=( $(compgen -W "${hosts}" -- ${cur}) )
+            return 0
+            ;;
+        edit)
+            # Complete with field names
+            COMPREPLY=( $(compgen -W "hostname user port identityfile" -- ${cur}) )
+            return 0
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- ${cur}) )
+            return 0
+            ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+    return 0
+}
+complete -F _ssh_manager_complete ssh-manager
+"""
+
+
+def _generate_zsh_completion() -> str:
+    """Generate zsh completion script."""
+    return """# ssh-manager zsh completion
+#compdef ssh-manager
+_ssh_manager() {
+    local context state line
+    local -A opt_args
+
+    _arguments -C \\
+        '(-h --help)'{-h,--help}'[Show help]' \\
+        '1: :->cmds' \\
+        '*::arg:->args'
+
+    case $state in
+        cmds)
+            _values 'ssh-manager commands' \\
+                'add[Add a new SSH config entry]' \\
+                'list[List all SSH config entries]' \\
+                'search[Search entries by host or hostname]' \\
+                'show[Show detailed information for a host]' \\
+                'edit[Edit an existing SSH config entry]' \\
+                'delete[Delete an SSH config entry]' \\
+                'include-list[List all Include config files]' \\
+                'include-add[Add a new Include config file]' \\
+                'include-show[Show content of an Include config file]' \\
+                'completion[Generate shell completion script]'
+            ;;
+        args)
+            case $line[1] in
+                show|edit|delete)
+                    local hosts=($(ssh-manager list 2>/dev/null | grep -E "^│ [a-zA-Z0-9]" | awk '{print $2}' | tr -d "│"))
+                    _values 'hosts' $hosts
+                    ;;
+                edit)
+                    _values 'fields' 'hostname' 'user' 'port' 'identityfile'
+                    ;;
+                completion)
+                    _values 'shells' 'bash' 'zsh' 'fish'
+                    ;;
+            esac
+            ;;
+    esac
+}
+compdef _ssh_manager ssh-manager
+"""
+
+
+def _generate_fish_completion() -> str:
+    """Generate fish completion script."""
+    return """# ssh-manager fish completion
+function __ssh_manager_hosts
+    ssh-manager list 2>/dev/null | grep -E "^│ [a-zA-Z0-9]" | awk '{print $2}' | tr -d "│"
+end
+
+complete -c ssh-manager -n "__fish_use_subcommand" -f -a "add list search show edit delete include-list include-add include-show completion --help"
+
+complete -c ssh-manager -n "__fish_seen_subcommand_from add" -f
+
+complete -c ssh-manager -n "__fish_seen_subcommand_from show" -f -a "(__ssh_manager_hosts)"
+
+complete -c ssh-manager -n "__fish_seen_subcommand_from edit" -f -a "(__ssh_manager_hosts)"
+
+complete -c ssh-manager -n "__fish_seen_subcommand_from edit" -n "__fish_seen_subcommand_from delete" -f -a "(__ssh_manager_hosts)"
+
+complete -c ssh-manager -n "__fish_seen_subcommand_from edit" -n "__fish_seen_subcommand_from edit" -f -a "hostname user port identityfile"
+
+complete -c ssh-manager -n "__fish_seen_subcommand_from completion" -f -a "bash zsh fish"
+"""
+
+
+def main() -> int:
+    """Main entry point."""
+    parser = build_parser()
+
+    # Setup shell completion if available
+    setup_argcomplete(parser)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    manager = SSHConfigManager()
+
+    try:
+        if args.command == "add":
+            manager.add_entry(
+                args.host, args.hostname, args.user, args.port, args.identity_file
+            )
+            console.print(f"[bold green]Host '{args.host}' added successfully.[/bold green]")
+
+        elif args.command == "list":
+            entries = manager.list_entries(args.verbose)
+            print_table(entries, "SSH Config Entries", args.verbose)
+
+        elif args.command == "search":
+            results = manager.search_entries(args.query)
+            print_table(results, f"Search Results for '{args.query}'")
+
+        elif args.command == "show":
+            host_data = manager.get_host(args.host)
+            if host_data is None:
+                console.print(f"[bold red]Error:[/bold red] Host '{args.host}' does not exist.")
+                return 1
+            print_host_details(args.host, host_data)
+
+        elif args.command == "edit":
+            manager.edit_entry(args.host, args.field, args.value)
+            console.print(f"[bold green]Host '{args.host}' updated successfully.[/bold green] "
+                          f"Field '{args.field}' set to '{args.value}'.")
+
+        elif args.command == "delete":
+            if confirm_deletion(args.host):
+                manager.delete_entry(args.host)
+                console.print(f"[bold green]Host '{args.host}' deleted successfully.[/bold green]")
+            else:
+                console.print("[yellow]Deletion canceled.[/yellow]")
+
+        elif args.command == "include-list":
+            includes = manager.list_includes()
+            if not includes:
+                console.print("[yellow]No Include files found in ~/.ssh/config.d/[/yellow]")
+            else:
+                table = Table(title="Include Files", show_header=True, header_style="bold magenta")
+                table.add_column("File", style="cyan")
+                table.add_column("Size", style="green", justify="right")
+                for inc in includes:
+                    table.add_row(inc.name, f"{inc.stat().st_size} bytes")
+                console.print(table)
+
+        elif args.command == "include-add":
+            include_path = manager.add_include(args.name, args.content.replace("\\n", "\n"))
+            console.print(f"[bold green]Include file created:[/bold green] {include_path}")
+
+        elif args.command == "include-show":
+            content = manager.show_include(args.name)
+            if content is None:
+                console.print(f"[bold red]Error:[/bold red] Include file '{args.name}' not found.")
+                return 1
+            console.print(content)
+
+        elif args.command == "completion":
+            shell = args.shell
+            if shell == "bash":
+                console.print(_generate_bash_completion())
+            elif shell == "zsh":
+                console.print(_generate_zsh_completion())
+            elif shell == "fish":
+                console.print(_generate_fish_completion())
+
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        return 1
+    except Exception as e:
+        console.print(f"[bold red]Unexpected error:[/bold red] {e}")
+        return 1
+
+    return 0
+
+
+
 
 if __name__ == "__main__":
-    main()  # Call the main function when the script is executed
+    sys.exit(main())
