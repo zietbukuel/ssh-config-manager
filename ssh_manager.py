@@ -5,20 +5,26 @@ validation, and Include directive support.
 
 Features:
 - Add, list, search, show, edit, delete SSH config entries
-- Automatic backup before writes
+- Automatic backup before writes with rotation
 - Hostname/port/identity file validation
 - Include directive support (config.d/ directories)
 - Shell completion (argcomplete + manual completion command)
 - Rich formatted output
+- Atomic file operations for safety
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import logging
+import os
 import re
 import shutil
 import sys
+import tempfile
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -35,20 +41,56 @@ except ImportError:
 # Initialize Rich console
 console = Console()
 
-# SSH config paths
-DEFAULT_SSH_DIR = Path.home() / ".ssh"
-DEFAULT_SSH_CONFIG_PATH = DEFAULT_SSH_DIR / "config"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger(__name__)
+
+# SSH config paths - respect environment variables
+DEFAULT_SSH_DIR = Path(os.environ.get("SSH_DIR", Path.home() / ".ssh"))
+DEFAULT_SSH_CONFIG_PATH = Path(os.environ.get("SSH_CONFIG", DEFAULT_SSH_DIR / "config"))
 DEFAULT_BACKUP_DIR = DEFAULT_SSH_DIR / "backups"
 DEFAULT_INCLUDE_DIR = DEFAULT_SSH_DIR / "config.d"
 
 # Validation constants
 MAX_PORT = 65535
 MIN_PORT = 1
+MAX_BACKUPS = 10  # Maximum number of backups to keep
 HOSTNAME_REGEX = re.compile(
     r'^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?$'
 )
 IPV4_REGEX = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
-IPV6_REGEX = re.compile(r'^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::$')
+
+
+class ConfigField(Enum):
+    """Enumeration of valid SSH config fields."""
+    HOSTNAME = "hostname"
+    USER = "user"
+    PORT = "port"
+    IDENTITYFILE = "identityfile"
+
+
+class SSHConfigError(Exception):
+    """Base exception for SSH config manager errors."""
+    pass
+
+
+class HostNotFoundError(SSHConfigError):
+    """Raised when a host is not found in the config."""
+    pass
+
+
+class ValidationError(SSHConfigError):
+    """Raised when validation fails."""
+    pass
+
+
+class FileOperationError(SSHConfigError):
+    """Raised when file operations fail."""
+    pass
 
 
 class SSHConfigManager:
@@ -59,43 +101,165 @@ class SSHConfigManager:
         self.ssh_dir = config_path.parent
         self.backup_dir = self.ssh_dir / "backups"
         self.include_dir = self.ssh_dir / "config.d"
-        self.ssh_dir.mkdir(mode=0o700, exist_ok=True)
-        self.backup_dir.mkdir(mode=0o700, exist_ok=True)
-        self.include_dir.mkdir(mode=0o700, exist_ok=True)
+        # Create directories with proper permissions (only if they don't exist)
+        for directory in [self.ssh_dir, self.backup_dir, self.include_dir]:
+            if not directory.exists():
+                directory.mkdir(mode=0o700, parents=True)
+            else:
+                # Ensure existing directories have correct permissions
+                try:
+                    current_mode = directory.stat().st_mode & 0o777
+                    if current_mode != 0o700:
+                        directory.chmod(0o700)
+                        logger.debug(f"Fixed permissions on {directory}")
+                except OSError as e:
+                    logger.warning(f"Could not fix permissions on {directory}: {e}")
 
-    def _create_backup(self) -> Path:
-        """Create a timestamped backup of the SSH config file."""
+    def _rotate_backups(self) -> None:
+        """Remove old backups keeping only the most recent MAX_BACKUPS."""
+        try:
+            if not self.backup_dir.exists():
+                return
+            
+            backups = sorted(
+                self.backup_dir.glob("config.backup.*"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            
+            for old_backup in backups[MAX_BACKUPS:]:
+                try:
+                    old_backup.unlink()
+                    logger.info(f"Rotated out old backup: {old_backup}")
+                except OSError as e:
+                    logger.warning(f"Failed to remove old backup {old_backup}: {e}")
+        except OSError as e:
+            logger.warning(f"Failed to rotate backups: {e}")
+
+    def _create_backup(self) -> Path | None:
+        """Create a timestamped backup of the SSH config file using atomic operations."""
+        if not self.config_path.exists():
+            return None
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = f"config.backup.{timestamp}"
         backup_path = self.backup_dir / backup_name
-        if self.config_path.exists():
-            shutil.copy2(self.config_path, backup_path)
-            backup_path.chmod(0o600)
+        
+        try:
+            # Use atomic copy with temporary file
+            with tempfile.NamedTemporaryFile(
+                dir=self.backup_dir,
+                delete=False,
+                mode='wb',
+                prefix='.tmp_backup_'
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(self.config_path.read_bytes())
+                tmp_path.chmod(0o600)
+            
+            # Atomic rename to final backup name
+            tmp_path.rename(backup_path)
             console.print(f"[dim]Backup created: {backup_path}[/dim]")
-        return backup_path
+            
+            # Rotate old backups
+            self._rotate_backups()
+            
+            return backup_path
+        except OSError as e:
+            logger.error(f"Failed to create backup: {e}")
+            raise FileOperationError(f"Backup creation failed: {e}") from e
+
+    def _atomic_write(self, content: str) -> None:
+        """Write content to config file atomically using temp file + rename."""
+        try:
+            # Create temp file in same directory for atomic rename
+            with tempfile.NamedTemporaryFile(
+                dir=self.config_path.parent,
+                delete=False,
+                mode='w',
+                prefix='.tmp_ssh_config_'
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(content)
+                tmp_path.chmod(0o600)
+            
+            # Atomic rename
+            tmp_path.rename(self.config_path)
+            logger.debug(f"Successfully wrote config to {self.config_path}")
+        except OSError as e:
+            # Clean up temp file if it exists
+            if 'tmp_path' in locals() and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            logger.error(f"Failed to write config: {e}")
+            raise FileOperationError(f"Config write failed: {e}") from e
 
     def load_config(self) -> Any:
         """Load SSH config, creating empty if missing."""
-        if not self.config_path.exists():
-            return empty_ssh_config_file()
-        return read_ssh_config(str(self.config_path))
+        try:
+            if not self.config_path.exists():
+                return empty_ssh_config_file()
+            return read_ssh_config(str(self.config_path))
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            raise FileOperationError(f"Failed to load config: {e}") from e
 
     def save_config(self, config: Any) -> None:
-        """Save config with automatic backup."""
-        self._create_backup()
-        config.write(str(self.config_path))
-        self.config_path.chmod(0o600)
+        """Save config with automatic backup using atomic operations."""
+        try:
+            self._create_backup()
+            # sshconf's write method expects a file path, not a file object or StringIO
+            # Write to temp file in the same directory, then use atomic rename
+            import tempfile as tmp
+            with tmp.NamedTemporaryFile(
+                dir=self.config_path.parent,
+                delete=False,
+                mode='w',
+                prefix='.tmp_ssh_config_',
+                suffix='.tmp'
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+            
+            # Write config to the temp file path
+            config.write(str(tmp_path))
+            tmp_path.chmod(0o600)
+            
+            # Atomic rename to final destination
+            tmp_path.rename(self.config_path)
+            logger.debug(f"Successfully wrote config to {self.config_path}")
+        except FileOperationError:
+            raise
+        except Exception as e:
+            # Clean up temp file if it exists
+            if 'tmp_path' in locals() and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            logger.error(f"Failed to save config: {e}")
+            raise FileOperationError(f"Config save failed: {e}") from e
 
     @staticmethod
     def validate_hostname(hostname: str) -> bool:
-        """Validate hostname or IP address."""
+        """Validate hostname or IP address using proper IP validation."""
         if not hostname:
             return False
+        
+        # Try IPv4 validation
         if IPV4_REGEX.match(hostname):
             parts = hostname.split('.')
             return len(parts) == 4 and all(0 <= int(part) <= 255 for part in parts)
-        if IPV6_REGEX.match(hostname):
+        
+        # Try IPv6 validation using ipaddress module (handles all valid formats)
+        try:
+            ipaddress.IPv6Address(hostname)
             return True
+        except ipaddress.AddressValueError:
+            pass
+        
+        # Fall back to hostname regex validation
         return bool(HOSTNAME_REGEX.match(hostname))
 
     @staticmethod
@@ -166,13 +330,13 @@ class SSHConfigManager:
         """Add a new SSH config entry with validation."""
         # Validate inputs
         if not self.validate_host_alias(host):
-            raise ValueError("Invalid host alias: must not be empty or contain spaces")
+            raise ValidationError("Invalid host alias: must not be empty or contain spaces")
         if not self.validate_hostname(hostname):
-            raise ValueError(f"Invalid hostname/IP: {hostname}")
+            raise ValidationError(f"Invalid hostname/IP: {hostname}")
         if not self.validate_port(port):
-            raise ValueError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
+            raise ValidationError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
         if identity_file and not self.validate_identity_file(identity_file):
-            raise ValueError(f"Identity file not found or not readable: {identity_file}")
+            raise ValidationError(f"Identity file not found or not readable: {identity_file}")
 
         config = self.load_config()
         if host in config.hosts():
@@ -189,37 +353,42 @@ class SSHConfigManager:
         """Edit a specific field of an existing entry."""
         config = self.load_config()
         if host not in config.hosts():
-            raise ValueError(f"Host '{host}' does not exist")
+            raise HostNotFoundError(f"Host '{host}' does not exist")
 
-        # Validate field-specific values
-        field_lower = field.lower()
+        # Validate field-specific values using enum
+        try:
+            field_enum = ConfigField(field.lower())
+        except ValueError:
+            valid_fields = [f.value for f in ConfigField]
+            raise ValidationError(f"Invalid field. Valid fields are: {', '.join(valid_fields)}")
+
         val_to_set: str | int = value
-        if field_lower == "port":
+        if field_enum == ConfigField.PORT:
             try:
                 port_val = int(value)
                 if not self.validate_port(port_val):
-                    raise ValueError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
+                    raise ValidationError(f"Port must be between {MIN_PORT} and {MAX_PORT}")
                 val_to_set = port_val
             except ValueError as e:
                 if "Port must be between" in str(e):
                     raise
-                raise ValueError("Port must be a valid integer") from e
-        elif field_lower == "hostname":
+                raise ValidationError("Port must be a valid integer") from e
+        elif field_enum == ConfigField.HOSTNAME:
             if not self.validate_hostname(value):
-                raise ValueError(f"Invalid hostname/IP: {value}")
-        elif field_lower == "identityfile":
+                raise ValidationError(f"Invalid hostname/IP: {value}")
+        elif field_enum == ConfigField.IDENTITYFILE:
             if not self.validate_identity_file(value):
-                raise ValueError(f"Identity file not found or not readable: {value}")
+                raise ValidationError(f"Identity file not found or not readable: {value}")
             val_to_set = str(Path(value).expanduser())
 
-        config.set(host, **{field_lower: val_to_set})
+        config.set(host, **{field_enum.value: val_to_set})
         self.save_config(config)
 
-    def delete_entry(self, host: str) -> None:
+    def delete_entry(self, host: str, force: bool = False) -> None:
         """Delete an SSH config entry."""
         config = self.load_config()
         if host not in config.hosts():
-            raise ValueError(f"Host '{host}' does not exist")
+            raise HostNotFoundError(f"Host '{host}' does not exist")
 
         config.remove(host)
         self.save_config(config)
@@ -232,43 +401,69 @@ class SSHConfigManager:
         """Add a new Include config file."""
         if not name.endswith(".conf"):
             name += ".conf"
-        include_path = self.include_dir / name
+        
+        # Sanitize filename to prevent directory traversal
+        safe_name = Path(name).name
+        if safe_name != name:
+            raise ValidationError(f"Invalid include file name: {name}")
+        
+        include_path = self.include_dir / safe_name
         if include_path.exists():
-            raise ValueError(f"Include file '{name}' already exists")
-        include_path.write_text(content)
-        include_path.chmod(0o600)
+            raise ValueError(f"Include file '{safe_name}' already exists")
+        
+        # Write atomically using temp file
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=self.include_dir,
+                delete=False,
+                mode='w',
+                prefix='.tmp_include_'
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(content)
+                tmp_path.chmod(0o600)
+            tmp_path.rename(include_path)
+        except OSError as e:
+            logger.error(f"Failed to create include file: {e}")
+            raise FileOperationError(f"Include file creation failed: {e}") from e
+        
         # Update main config to include this directory if not already present
         self._ensure_include_directive()
         return include_path
 
     def _ensure_include_directive(self) -> None:
         """Ensure main config has Include directive for config.d/"""
-        # Ensure config file exists
-        self.config_path.parent.mkdir(mode=0o700, exist_ok=True)
-        if not self.config_path.exists():
-            self.config_path.write_text("")
-            self.config_path.chmod(0o600)
+        try:
+            # Ensure config file exists
+            self.config_path.parent.mkdir(mode=0o700, exist_ok=True)
+            if not self.config_path.exists():
+                self.config_path.write_text("")
+                self.config_path.chmod(0o600)
 
-        # Check if Include directive exists
-        has_include = False
-        content = self.config_path.read_text()
-        if "Include" in content and "config.d" in content:
-            has_include = True
+            # Check if Include directive exists (more robust check)
+            content = self.config_path.read_text()
+            # Look for actual Include directive pattern, not just substring match
+            include_pattern = re.compile(r'^\s*Include\s+.*config\.d', re.MULTILINE)
+            has_include = bool(include_pattern.search(content))
 
-        if not has_include:
-            # Prepend Include directive
-            with open(self.config_path, "r+") as f:
-                existing = f.read()
-                f.seek(0, 0)
-                f.write(f"Include config.d/*.conf\n\n{existing}")
+            if not has_include:
+                # Prepend Include directive atomically
+                new_content = f"Include config.d/*.conf\n\n{content}"
+                self._atomic_write(new_content)
+                logger.info("Added Include directive for config.d/")
+        except OSError as e:
+            logger.error(f"Failed to ensure include directive: {e}")
+            raise FileOperationError(f"Failed to update config with Include directive: {e}") from e
 
     def show_include(self, name: str) -> str | None:
         """Show content of an include file."""
-        include_path = self.include_dir / name
+        # Sanitize filename to prevent directory traversal
+        safe_name = Path(name).name
+        include_path = self.include_dir / safe_name
         if not include_path.exists():
             # Try with .conf extension
-            if not name.endswith(".conf"):
-                include_path = self.include_dir / f"{name}.conf"
+            if not safe_name.endswith(".conf"):
+                include_path = self.include_dir / f"{safe_name}.conf"
         if include_path.exists():
             return include_path.read_text()
         return None
@@ -309,8 +504,10 @@ def print_host_details(host: str, host_data: dict) -> None:
     console.print(table)
 
 
-def confirm_deletion(host: str) -> bool:
-    """Prompt user for deletion confirmation."""
+def confirm_deletion(host: str, force: bool = False) -> bool:
+    """Prompt user for deletion confirmation unless force is True."""
+    if force:
+        return True
     response = console.input(f"[bold yellow]Are you sure you want to delete host '{host}'? (y/n): [/]")
     return response.lower() == 'y'
 
@@ -398,6 +595,8 @@ Examples:
     # Delete command
     delete_parser = subparsers.add_parser("delete", help="Delete an SSH config entry")
     delete_parser.add_argument("host", help="Host alias to delete")
+    delete_parser.add_argument("-f", "--force", action="store_true",
+                               help="Skip confirmation prompt")
 
     # Include commands
     subparsers.add_parser("include-list",
@@ -570,7 +769,7 @@ def main() -> int:
                           f"Field '{args.field}' set to '{args.value}'.")
 
         elif args.command == "delete":
-            if confirm_deletion(args.host):
+            if confirm_deletion(args.host, getattr(args, 'force', False)):
                 manager.delete_entry(args.host)
                 console.print(f"[bold green]Host '{args.host}' deleted successfully.[/bold green]")
             else:
@@ -608,11 +807,16 @@ def main() -> int:
             elif shell == "fish":
                 console.print(_generate_fish_completion())
 
-    except ValueError as e:
+    except (ValueError, ValidationError, HostNotFoundError) as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         return 1
+    except FileOperationError as e:
+        logger.error(f"File operation failed: {e}")
+        console.print(f"[bold red]Error:[/bold red] File operation failed. Check logs for details.")
+        return 1
     except Exception as e:
-        console.print(f"[bold red]Unexpected error:[/bold red] {e}")
+        logger.exception(f"Unexpected error: {e}")
+        console.print(f"[bold red]Unexpected error:[/bold red] {type(e).__name__}. Check logs for details.")
         return 1
 
     return 0
